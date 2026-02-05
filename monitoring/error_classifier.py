@@ -1,20 +1,4 @@
-"""
-Error Classifier
-Classifies errors into 5 categories — rule-based, no Azure tokens consumed.
 
-Categories:
-  1. SQL_GENERATION    — LLM produced invalid / unparseable SQL
-  2. CONTEXT_RETRIEVAL — schema info missing or wrong table referenced
-  3. DATA_ERROR        — query valid but data doesn't exist / empty result
-  4. INTEGRATION       — connection, timeout, HTTP errors
-  5. AGENT_LOGIC       — agent-level reasoning failure
-
-Severity:
-  low      — informational, no action needed
-  medium   — monitor, may need attention
-  high     — repeated pattern, investigate
-  critical — system cannot serve queries
-"""
 import re
 import psycopg2
 from typing import Dict, Optional
@@ -92,17 +76,7 @@ class ErrorClassifier:
 
     def classify(self, error_message: str, query_id: Optional[str] = None,
                  evaluation_id: Optional[int] = None) -> Dict:
-        """
-        Classify an error message into one of 5 categories.
-
-        Args:
-            error_message: the error string
-            query_id: optional query ID for storage
-            evaluation_id: optional evaluation ID for storage
-
-        Returns:
-            classification dict
-        """
+       
         if not error_message:
             return self._build_result(query_id, evaluation_id, "UNKNOWN", "low", error_message)
 

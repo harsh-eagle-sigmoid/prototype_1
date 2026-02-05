@@ -3,28 +3,28 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { fetchErrors } from './api';
 
 const CAT_COLORS = {
-  SQL_GENERATION:        '#ff6b6b',
-  SQL_GENERATION_ERROR:  '#ff9a9a',
-  CONTEXT_RETRIEVAL:     '#f7b731',
-  DATA_ERROR:            '#4c9eff',
-  INTEGRATION:           '#a55eea',
-  AGENT_LOGIC:           '#3ecf8e',
+  SQL_GENERATION: '#ff6b6b',
+  SQL_GENERATION_ERROR: '#ff9a9a',
+  CONTEXT_RETRIEVAL: '#f7b731',
+  DATA_ERROR: '#4c9eff',
+  INTEGRATION: '#a55eea',
+  AGENT_LOGIC: '#3ecf8e',
 };
 
 export default function ErrorsPanel() {
-  const [data, setData]   = useState(null);
+  const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
   // Auto-refresh every 10 seconds
   useEffect(() => {
     const load = () => fetchErrors().then(setData).catch(e => setError(e.message));
     load();  // Initial load
-    const interval = setInterval(load, 10000);
+    const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
   }, []);
 
   if (error) return <p className="error-msg">{error}</p>;
-  if (!data)  return <p className="loading">Loading errors...</p>;
+  if (!data) return <p className="loading">Loading errors...</p>;
 
   const { total_errors, categories, recent_errors } = data;
 
@@ -42,7 +42,7 @@ export default function ErrorsPanel() {
         </div>
         {Object.entries(categories).map(([cat, d]) => (
           <div className="card" key={cat}>
-            <div className="label">{cat.replace(/_/g,' ')}</div>
+            <div className="label">{cat.replace(/_/g, ' ')}</div>
             <div className="value orange">{d.count}</div>
           </div>
         ))}
@@ -55,8 +55,8 @@ export default function ErrorsPanel() {
           <ResponsiveContainer width="100%" height={240}>
             <PieChart>
               <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={85}
-                   label={({ name, percent }) => `${name.replace(/_/g,' ')} ${(percent*100).toFixed(0)}%`}
-                   labelLine={false} fontSize={11}>
+                label={({ name, percent }) => `${name.replace(/_/g, ' ')} ${(percent * 100).toFixed(0)}%`}
+                labelLine={false} fontSize={11}>
                 {pieData.map((entry) => (
                   <Cell key={entry.name} fill={CAT_COLORS[entry.name] || '#7a8fa3'} />
                 ))}
@@ -74,7 +74,7 @@ export default function ErrorsPanel() {
             <tbody>
               {Object.entries(categories).map(([cat, d]) => (
                 <tr key={cat}>
-                  <td style={{ fontWeight: 600, color: '#fff', fontSize: '0.82rem' }}>{cat.replace(/_/g,' ')}</td>
+                  <td style={{ fontWeight: 600, color: '#fff', fontSize: '0.82rem' }}>{cat.replace(/_/g, ' ')}</td>
                   <td>{d.count}</td>
                   <td>
                     {Object.entries(d.severities).map(([sev, cnt]) => (
@@ -91,19 +91,36 @@ export default function ErrorsPanel() {
       {/* Recent errors full-width */}
       <div className="panel" style={{ marginTop: 0 }}>
         <h3>Recent Errors</h3>
-        <table className="data-table">
-          <thead><tr><th>Query ID</th><th>Category</th><th>Severity</th><th>Message</th></tr></thead>
-          <tbody>
-            {recent_errors.map((e, i) => (
-              <tr key={i}>
-                <td className="mono">{e.query_id}</td>
-                <td style={{ color: '#fff', fontWeight: 600, fontSize: '0.82rem' }}>{e.category.replace(/_/g,' ')}</td>
-                <td><span className={`badge ${e.severity.toLowerCase()}`}>{e.severity}</span></td>
-                <td style={{ maxWidth: 400, wordBreak: 'break-word' }}>{e.message.slice(0, 100)}{e.message.length > 100 ? '…' : ''}</td>
+        <div style={{ overflowX: 'auto', maxHeight: '500px', overflowY: 'auto' }}>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Query ID</th>
+                <th>Query</th>
+                <th>Category</th>
+                <th>Severity</th>
+                <th>Message</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {recent_errors.map((e, i) => (
+                <tr key={i}>
+                  <td className="mono" style={{ whiteSpace: 'nowrap' }}>{e.query_id}</td>
+                  <td style={{ color: '#b0c4d8', fontSize: '0.82rem', maxWidth: '250px' }} title={e.query_text}>
+                    {e.query_text}
+                  </td>
+                  <td style={{ color: '#fff', fontWeight: 600, fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
+                    {e.category.replace(/_/g, ' ')}
+                  </td>
+                  <td><span className={`badge ${e.severity.toLowerCase()}`}>{e.severity}</span></td>
+                  <td style={{ maxWidth: 400, wordBreak: 'break-word' }}>
+                    {e.message.slice(0, 100)}{e.message.length > 100 ? '…' : ''}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </>
   );

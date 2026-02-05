@@ -6,9 +6,10 @@ import DriftPanel from './DriftPanel';
 import ErrorsPanel from './ErrorsPanel';
 import QueryPanel from './QueryPanel';
 import ExecutionsPanel from './ExecutionsPanel';
+import AlertsPanel from './AlertsPanel';
 import AuthProvider, { LoginButton, RequireAuth, useAuth } from './AuthProvider';
 
-const TABS = ['Metrics', 'Drift', 'Errors', 'Executions', 'Query'];
+const TABS = ['Metrics', 'Drift', 'Errors', 'Executions', 'Alerts'];
 
 function Dashboard() {
   const [tab, setTab] = useState('Metrics');
@@ -19,7 +20,7 @@ function Dashboard() {
   useEffect(() => {
     const poll = () => fetchHealth().then(setHealth).catch(() => { });
     poll();
-    const id = setInterval(poll, 10_000);
+    const id = setInterval(poll, 3000);
     return () => clearInterval(id);
   }, []);
 
@@ -54,7 +55,7 @@ function Dashboard() {
         {tab === 'Drift' && <DriftPanel />}
         {tab === 'Errors' && <ErrorsPanel />}
         {tab === 'Executions' && <ExecutionsPanel />}
-        {tab === 'Query' && <QueryPanel />}
+        {tab === 'Alerts' && <AlertsPanel />}
       </main>
     </div>
   );

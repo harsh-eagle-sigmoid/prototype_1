@@ -158,7 +158,7 @@ class DriftDetector:
                 "anomaly_flag": False
             }
 
-        # Cosine similarity to baseline centroid
+        # Cosine similarity to baseline centroid 
         similarity = self._cosine_similarity(query_embedding, baseline)
 
         # Classify drift

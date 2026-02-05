@@ -2,9 +2,12 @@
 import json
 import requests as http
 import psycopg2
+from psycopg2 import pool
+from contextlib import contextmanager
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query, Depends
+import decimal
+from fastapi import FastAPI, HTTPException, Query, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -39,10 +42,33 @@ AGENT_URLS = {
     "demand": "http://localhost:8002",
 }
 
+
 # ── Global caches (lazy loaded) ─────────────────────────────────────────────
 _drift_detector = None
 _error_classifier = None
-_ground_truth_cache = None  # {query_text: {query_id, sql, complexity, agent_type}}
+_ground_truth_cache = None
+db_pool = None
+
+@app.on_event("startup")
+def startup_event():
+    global db_pool
+    try:
+        db_pool = pool.SimpleConnectionPool(
+            1, 20,
+            host=settings.DB_HOST, port=settings.DB_PORT,
+            database=settings.DB_NAME,
+            user=settings.DB_USER, password=settings.DB_PASSWORD
+        )
+        logger.info("DB Connection Pool initialized")
+    except Exception as e:
+        logger.error(f"Failed to create DB pool: {e}")
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global db_pool
+    if db_pool:
+        db_pool.closeall()
+        logger.info("DB Connection Pool closed")
 
 def get_drift_detector():
     """Lazy load drift detector (loads embedding model)."""
@@ -72,7 +98,7 @@ def get_ground_truth():
             # Index by normalized query text for lookup
             _ground_truth_cache = {}
             for q in gt_list:
-                key = q["query_text"].strip().lower()
+                key = q["query_text"].strip().lower().rstrip("?.!")
                 _ground_truth_cache[key] = {
                     "query_id": q["query_id"],
                     "sql": q["sql"],
@@ -88,21 +114,30 @@ def get_ground_truth():
 def lookup_ground_truth(query_text: str) -> Optional[Dict]:
     """Find ground truth for a query (exact match on normalized text)."""
     gt = get_ground_truth()
-    key = query_text.strip().lower()
+    key = query_text.strip().lower().rstrip("?.!")
     return gt.get(key)
 
 # ── DB helper ────────────────────────────────────────────────────────────────
-def _db():
-    return psycopg2.connect(
-        host=settings.DB_HOST, port=settings.DB_PORT,
-        database=settings.DB_NAME,
-        user=settings.DB_USER, password=settings.DB_PASSWORD
-    )
+@contextmanager
+def get_db():
+    conn = db_pool.getconn()
+    try:
+        yield conn
+    finally:
+        db_pool.putconn(conn)
 
 # ── Pydantic request models ──────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query:      str
     agent_type: str = Field(..., description="'spend' or 'demand'")
+
+class IngestRequest(BaseModel):
+    query_text: str
+    agent_type: str
+    status: str
+    sql: Optional[str] = None
+    error: Optional[str] = None
+    execution_time_ms: Optional[float] = 0.0
 
 class EvaluateRequest(BaseModel):
     query_id:         str
@@ -115,6 +150,10 @@ class EvaluateRequest(BaseModel):
 class BaselineUpdateRequest(BaseModel):
     agent_type: str = Field(..., description="'spend' or 'demand'")
     queries:    List[str]
+
+class SqlExecuteRequest(BaseModel):
+    sql: str
+    agent_type: str
 
 # ── Health ───────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -176,15 +215,14 @@ async def route_query(req: QueryRequest, user: Optional[AuthUser] = Depends(get_
 
     # Log initial query to DB
     try:
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO monitoring.queries (query_id, query_text, agent_type, user_id, status)
-            VALUES (%s, %s, %s, %s, 'pending')
-        """, (query_id, req.query, req.agent_type, user.sub if user else None))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO monitoring.queries (query_id, query_text, agent_type, user_id, status)
+                VALUES (%s, %s, %s, %s, 'pending')
+            """, (query_id, req.query, req.agent_type, user.sub if user else None))
+            conn.commit()
+            cur.close()
     except Exception as e:
         logger.error(f"Failed to log query to DB: {e}")
 
@@ -329,6 +367,71 @@ async def route_query(req: QueryRequest, user: Optional[AuthUser] = Depends(get_
 
     return response
 
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# NEW: ASYNC TELEMETRY INGEST
+# ─────────────────────────────────────────────────────────────────────────
+
+def process_ingest_background(query_id: str, req: IngestRequest):
+    """Run heavy monitoring tasks in background to avoid blocking agents."""
+    # 2. Drift
+    try:
+        drift_detector = get_drift_detector()
+        drift_detector.detect(query_id, req.query_text, req.agent_type)
+    except Exception as e:
+        logger.error(f"Drift check failed: {e}")
+
+    # 3. Error
+    if req.status == "error" and req.error:
+        try:
+            error_classifier = get_error_classifier()
+            error_classifier.classify(req.error, query_id)
+        except Exception as e:
+            logger.error(f"Error classify failed: {e}")
+
+    # 4. Evaluation
+    if req.sql and req.status == "success":
+        gt = lookup_ground_truth(req.query_text)
+        if gt:
+            try:
+                from evaluation.evaluator import Evaluator
+                evaluator = Evaluator(req.agent_type)
+                eval_result = evaluator.evaluate(
+                    query_id=query_id,
+                    query_text=req.query_text,
+                    generated_sql=req.sql,
+                    ground_truth_sql=gt["sql"],
+                    complexity=gt["complexity"]
+                )
+                evaluator.store_result(eval_result)
+            except Exception as e:
+                logger.error(f"Evaluation failed: {e}")
+
+@app.post("/api/v1/monitor/ingest")
+async def ingest_telemetry(req: IngestRequest, background_tasks: BackgroundTasks):
+    """Receives async logs from independent agents."""
+    query_id = f"ASYNC-{req.agent_type.upper()}-{uuid.uuid4().hex[:8]}"
+    logger.info(f"[{query_id}] Ingesting telemetry: {req.query_text}")
+
+    # 1. Log to DB (Sync, must happen now to reserve ID)
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO monitoring.queries (query_id, query_text, agent_type, status, generated_sql)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (query_id, req.query_text, req.agent_type, req.status, req.sql))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.error(f"DB Insert failed: {e}")
+
+    # Queue heavy tasks
+    background_tasks.add_task(process_ingest_background, query_id, req)
+
+    return {"status": "ingested", "query_id": query_id}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ██  MANUAL ENDPOINTS (unchanged)                                            ██
 # ══════════════════════════════════════════════════════════════════════════════
@@ -358,43 +461,73 @@ async def evaluate(req: EvaluateRequest, user: Optional[AuthUser] = Depends(get_
         "reasoning":  result.get("steps", {}).get("llm_judge", {}).get("reasoning", "")
     }
 
+# ── POST /api/v1/debug/execute ──────────────────────────────────────────────
+@app.post("/api/v1/debug/execute")
+def execute_sql(req: SqlExecuteRequest):
+    """Execute SQL for debugging purposes."""
+    if not req.sql.strip().upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT statements are allowed for debugging.")
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(req.sql)
+            if cur.description:
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                results = []
+                for row in rows[:50]:
+                    item = {}
+                    for i, col in enumerate(columns):
+                        val = row[i]
+                        if isinstance(val, (datetime, decimal.Decimal)):
+                            val = str(val)
+                        item[col] = val
+                    results.append(item)
+                return {"status": "success", "results": results}
+            return {"status": "success", "results": []}
+        except Exception as e:
+            logger.error(f"Debug execution failed: {e}")
+            return {"status": "error", "error": str(e)}
+        finally:
+            cur.close()
+
 # ── GET /api/v1/metrics ──────────────────────────────────────────────────────
 @app.get("/api/v1/metrics")
 def get_metrics():
     """Overall + per-agent accuracy metrics from monitoring.evaluations."""
-    conn = _db()
-    cur  = conn.cursor()
+    with get_db() as conn:
+        cur  = conn.cursor()
 
-    cur.execute("""
-        SELECT COUNT(*),
-               SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END),
-               AVG(final_score)
-        FROM monitoring.evaluations
-    """)
-    total, passed, avg_score = cur.fetchone()
-    total  = total  or 0
-    passed = passed or 0
+        cur.execute("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END),
+                   AVG(final_score)
+            FROM monitoring.evaluations
+        """)
+        total, passed, avg_score = cur.fetchone()
+        total  = total  or 0
+        passed = passed or 0
 
-    cur.execute("""
-        SELECT agent_type,
-               COUNT(*),
-               SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END),
-               AVG(final_score)
-        FROM monitoring.evaluations
-        GROUP BY agent_type
-    """)
-    per_agent = {}
-    for row in cur.fetchall():
-        t, p = row[1], row[2] or 0
-        per_agent[row[0]] = {
-            "total":    t,
-            "passed":   p,
-            "accuracy": round(p / t * 100, 1) if t else 0,
-            "avg_score": round(float(row[3]), 3) if row[3] else 0.0
-        }
+        cur.execute("""
+            SELECT agent_type,
+                   COUNT(*),
+                   SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END),
+                   AVG(final_score)
+            FROM monitoring.evaluations
+            GROUP BY agent_type
+        """)
+        per_agent = {}
+        for row in cur.fetchall():
+            t, p = row[1], row[2] or 0
+            per_agent[row[0]] = {
+                "total":    t,
+                "passed":   p,
+                "accuracy": round(p / t * 100, 1) if t else 0,
+                "avg_score": round(float(row[3]), 3) if row[3] else 0.0
+            }
 
-    cur.close()
-    conn.close()
+        cur.close()
 
     return {
         "overall": {
@@ -411,42 +544,50 @@ def get_metrics():
 @app.get("/api/v1/drift")
 def get_drift(agent_type: Optional[str] = Query(None)):
     """Drift distribution, anomaly count, and top high-drift samples."""
-    conn = _db()
-    cur  = conn.cursor()
+    with get_db() as conn:
+        cur  = conn.cursor()
 
-    where, params = "", []
-    if agent_type:
-        prefix = "SPEND" if agent_type == "spend" else "DEMAND"
-        where  = " WHERE query_id LIKE %s"
-        params = [f"{prefix}%"]
+        where, params = "", []
+        if agent_type:
+            # Match 'LIVE-SPEND...' or 'ASYNC-SPEND...'
+            keyword = "SPEND" if agent_type.lower() == "spend" else "DEMAND"
+            where  = " WHERE query_id LIKE %s"
+            params = [f"%{keyword}%"]
 
-    cur.execute(f"""
-        SELECT LOWER(drift_classification), COUNT(*), AVG(drift_score)
-        FROM monitoring.drift_monitoring {where}
-        GROUP BY LOWER(drift_classification)
-        ORDER BY LOWER(drift_classification)
-    """, params)
-    distribution = {
-        row[0]: {"count": row[1], "avg_drift_score": round(float(row[2]), 3)}
-        for row in cur.fetchall()
-    }
+        cur.execute(f"""
+            SELECT LOWER(drift_classification), COUNT(*), AVG(drift_score)
+            FROM monitoring.drift_monitoring {where}
+            GROUP BY LOWER(drift_classification)
+            ORDER BY LOWER(drift_classification)
+        """, params)
+        distribution = {
+            row[0]: {"count": row[1], "avg_drift_score": round(float(row[2]), 3)}
+            for row in cur.fetchall()
+        }
 
-    cur.execute(f"SELECT COUNT(*) FROM monitoring.drift_monitoring WHERE is_anomaly = true {where.replace('WHERE','AND') if where else ''}", params)
-    anomalies = cur.fetchone()[0]
+        cur.execute(f"SELECT COUNT(*) FROM monitoring.drift_monitoring WHERE is_anomaly = true {where.replace('WHERE','AND') if where else ''}", params)
+        anomalies = cur.fetchone()[0]
 
-    cur.execute(f"""
-        SELECT query_id, drift_score, drift_classification
-        FROM monitoring.drift_monitoring
-        WHERE LOWER(drift_classification) = 'high' {('AND query_id LIKE %s' if agent_type else '')}
-        ORDER BY drift_score DESC LIMIT 5
-    """, params if agent_type else [])
-    high_samples = [
-        {"query_id": r[0], "drift_score": round(float(r[1]), 3), "classification": r[2]}
-        for r in cur.fetchall()
-    ]
+        cur.execute(f"""
+            SELECT d.query_id, d.drift_score, d.drift_classification, q.query_text, q.generated_sql, q.agent_type
+            FROM monitoring.drift_monitoring d
+            LEFT JOIN monitoring.queries q ON d.query_id = q.query_id
+            WHERE LOWER(d.drift_classification) = 'high' {('AND d.query_id LIKE %s' if agent_type else '')}
+            ORDER BY d.drift_score DESC LIMIT 20
+        """, params if agent_type else [])
+        high_samples = [
+            {
+                "query_id": r[0], 
+                "drift_score": round(float(r[1]), 3), 
+                "classification": r[2],
+                "query_text": r[3] or "Unknown",
+                "sql": r[4] or "Not Available (No Eval)",
+                "agent_type": r[5] or "spend"
+            }
+            for r in cur.fetchall()
+        ]
 
-    cur.close()
-    conn.close()
+        cur.close()
 
     return {
         "distribution":      distribution,
@@ -458,38 +599,48 @@ def get_drift(agent_type: Optional[str] = Query(None)):
 @app.get("/api/v1/errors")
 def get_errors(category: Optional[str] = Query(None), limit: int = Query(20)):
     """Error summary grouped by category + recent errors list."""
-    conn = _db()
-    cur  = conn.cursor()
+    with get_db() as conn:
+        cur  = conn.cursor()
 
-    cur.execute("""
-        SELECT error_category, severity, COUNT(*)
-        FROM monitoring.errors
-        GROUP BY error_category, severity
-        ORDER BY error_category
-    """)
-    categories = {}
-    for row in cur.fetchall():
-        cat = row[0]
-        if cat not in categories:
-            categories[cat] = {"count": 0, "severities": {}}
-        categories[cat]["count"]            += row[2]
-        categories[cat]["severities"][row[1]] = row[2]
+        cur.execute("""
+            SELECT error_category, severity, COUNT(*)
+            FROM monitoring.errors
+            GROUP BY error_category, severity
+            ORDER BY error_category
+        """)
+        categories = {}
+        for row in cur.fetchall():
+            cat = row[0]
+            if cat not in categories:
+                categories[cat] = {"count": 0, "severities": {}}
+            categories[cat]["count"]            += row[2]
+            categories[cat]["severities"][row[1]] = row[2]
 
-    q      = "SELECT query_id, error_category, error_message, severity FROM monitoring.errors"
-    params = []
-    if category:
-        q     += " WHERE error_category = %s"
-        params.append(category)
-    q += " ORDER BY first_seen DESC LIMIT %s"
-    params.append(limit)
-    cur.execute(q, params)
-    recent = [
-        {"query_id": r[0], "category": r[1], "message": r[2], "severity": r[3]}
-        for r in cur.fetchall()
-    ]
+        q_sql = """
+            SELECT e.query_id, e.error_category, e.error_message, e.severity, q.query_text
+            FROM monitoring.errors e
+            LEFT JOIN monitoring.queries q ON e.query_id = q.query_id
+        """
+        params = []
+        if category:
+            q_sql += " WHERE e.error_category = %s"
+            params.append(category)
+        q_sql += " ORDER BY e.first_seen DESC LIMIT %s"
+        params.append(limit)
+        
+        cur.execute(q_sql, tuple(params))
+        recent = [
+            {
+                "query_id": r[0], 
+                "category": r[1], 
+                "message": r[2], 
+                "severity": r[3],
+                "query_text": r[4] or "Unknown"
+            }
+            for r in cur.fetchall()
+        ]
 
-    cur.close()
-    conn.close()
+        cur.close()
 
     return {
         "total_errors": sum(c["count"] for c in categories.values()),
@@ -501,53 +652,54 @@ def get_errors(category: Optional[str] = Query(None), limit: int = Query(20)):
 @app.get("/api/v1/errors/{category}")
 def get_errors_by_category(category: str):
     """All errors for a specific category with suggested fixes."""
-    conn = _db()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT query_id, error_message, severity, suggested_fix, first_seen
-        FROM monitoring.errors
-        WHERE error_category = %s
-        ORDER BY first_seen DESC
-    """, (category,))
-    errors = [
-        {
-            "query_id":      r[0],
-            "message":       r[1],
-            "severity":      r[2],
-            "suggested_fix": r[3],
-            "first_seen":    str(r[4])
-        }
-        for r in cur.fetchall()
-    ]
-    cur.close()
-    conn.close()
+    with get_db() as conn:
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT query_id, error_message, severity, suggested_fix, first_seen
+            FROM monitoring.errors
+            WHERE error_category = %s
+            ORDER BY first_seen DESC
+        """, (category,))
+        errors = [
+            {
+                "query_id":      r[0],
+                "message":       r[1],
+                "severity":      r[2],
+                "suggested_fix": r[3],
+                "first_seen":    str(r[4])
+            }
+            for r in cur.fetchall()
+        ]
+        cur.close()
     return {"category": category, "count": len(errors), "errors": errors}
 
 # ── GET /api/v1/history ────────────────────────────────────────────────────
 @app.get("/api/v1/history")
 def get_history(limit: int = 50):
     """Get history of execution runs with evaluation and error details."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT 
-            q.query_text,
-            e.result,
-            e.confidence,
-            r.error_category,
-            q.agent_type,
-            q.created_at,
-            q.query_id
-        FROM monitoring.queries q
-        LEFT JOIN monitoring.evaluations e ON q.query_id = e.query_id
-        LEFT JOIN monitoring.errors r ON q.query_id = r.query_id
-        ORDER BY q.created_at DESC
-        LIMIT %s
-    """, (limit,))
-    
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                q.query_text,
+                e.result,
+                e.confidence,
+                r.error_category,
+                q.agent_type,
+                q.created_at,
+                q.query_id,
+                d.drift_score,
+                d.drift_classification
+            FROM monitoring.queries q
+            LEFT JOIN monitoring.evaluations e ON q.query_id = e.query_id
+            LEFT JOIN monitoring.errors r ON q.query_id = r.query_id
+            LEFT JOIN monitoring.drift_monitoring d ON q.query_id = d.query_id
+            ORDER BY q.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        
+        rows = cur.fetchall()
+        cur.close()
 
     history = []
     for row in rows:
@@ -556,9 +708,11 @@ def get_history(limit: int = 50):
             "correctness_verdict": row[1] or "N/A",
             "evaluation_confidence": row[2] if row[2] is not None else 0.0,
             "error_bucket": row[3] or "None",
-            "dataset": row[4],  # agent_type
+            "dataset": row[4],
             "timestamp": str(row[5]),
-            "query_id": row[6]
+            "query_id": row[6],
+            "drift_score": row[7] if row[7] is not None else 0.0,
+            "drift_level": row[8] or "N/A"
         })
     return history
 
@@ -572,6 +726,61 @@ def update_baseline(req: BaselineUpdateRequest):
     dd = get_drift_detector()
     result = dd.create_baseline(req.agent_type, req.queries)
     return {"status": "ok", "result": result}
+
+
+# ── GET /api/v1/alerts ───────────────────────────────────────────────────────
+@app.get("/api/v1/alerts")
+def get_alerts():
+    """Generate active alerts based on drift, accuracy, and errors."""
+    alerts = []
+    
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # 1. EVALUATION ACCURACY CHECK
+        # Check last 50 evaluations. If accuracy < 90%, fire alert.
+        cur.execute("""
+            SELECT AVG(final_score), COUNT(*) 
+            FROM (SELECT final_score FROM monitoring.evaluations ORDER BY created_at DESC LIMIT 50) sub
+        """)
+        row = cur.fetchone()
+        avg_score = float(row[0]) if row and row[0] is not None else 1.0
+        count = row[1] if row else 0
+        
+        if count > 5 and avg_score < 0.90:
+             alerts.append({
+                "id": str(uuid.uuid4()),
+                "title": "Evaluation Accuracy Degradation",
+                "severity": "warning",
+                "message": f"Accuracy dropped to {round(avg_score*100, 1)}% (Threshold: 90%)",
+                "reason": f"Based on last {count} evaluations.",
+                "timestamp": datetime.now().isoformat()
+             })
+
+        # 2. DRIFT CHECK
+        # Check for High Drift in last 24h (or last 50 queries)
+        # We join with queries to ensure we are looking at recent activity
+        cur.execute("""
+            SELECT COUNT(*) FROM monitoring.drift_monitoring d
+            JOIN monitoring.queries q ON d.query_id = q.query_id
+            WHERE d.drift_classification = 'high' 
+            AND q.created_at > NOW() - INTERVAL '24 hours'
+        """)
+        high_drift_count = cur.fetchone()[0]
+        
+        if high_drift_count > 0:
+            alerts.append({
+                "id": str(uuid.uuid4()),
+                "title": "High Drift Detected",
+                "severity": "critical" if high_drift_count > 3 else "warning",
+                "message": f"{high_drift_count} High Drift queries detected in last 24h.",
+                "reason": "User queries deviate significantly from the baseline.",
+                "timestamp": datetime.now().isoformat()
+            })
+
+        cur.close()
+
+    return alerts
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":

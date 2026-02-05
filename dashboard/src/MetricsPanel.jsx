@@ -3,25 +3,25 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { fetchMetrics } from './api';
 
 export default function MetricsPanel() {
-  const [data, setData]   = useState(null);
+  const [data, setData] = useState(null);
   const [error, setError] = useState(null);
 
   // Auto-refresh every 10 seconds
   useEffect(() => {
     const load = () => fetchMetrics().then(setData).catch(e => setError(e.message));
     load();  // Initial load
-    const interval = setInterval(load, 10000);  // Poll every 10s
+    const interval = setInterval(load, 3000);  // Poll every 3s
     return () => clearInterval(interval);
   }, []);
 
   if (error) return <p className="error-msg">{error}</p>;
-  if (!data)  return <p className="loading">Loading metrics...</p>;
+  if (!data) return <p className="loading">Loading metrics...</p>;
 
   const { overall, per_agent } = data;
 
   // Bar chart data: one bar per agent
   const chartData = Object.entries(per_agent).map(([name, d]) => ({
-    agent:    name.charAt(0).toUpperCase() + name.slice(1),
+    agent: name.charAt(0).toUpperCase() + name.slice(1),
     Accuracy: d.accuracy,
     AvgScore: +(d.avg_score * 100).toFixed(1),
   }));
@@ -62,8 +62,8 @@ export default function MetricsPanel() {
               <XAxis dataKey="agent" stroke="#5a7a99" fontSize={13} />
               <YAxis domain={[0, 100]} stroke="#5a7a99" fontSize={12} unit="%" />
               <Tooltip contentStyle={{ background: '#1e2736', border: '1px solid #2a3548', borderRadius: 6, color: '#c8d6e5' }} />
-              <Bar dataKey="Accuracy" fill="#4c9eff" radius={[4,4,0,0]} />
-              <Bar dataKey="AvgScore" fill="#3ecf8e" radius={[4,4,0,0]} name="Avg Score %" />
+              <Bar dataKey="Accuracy" fill="#4c9eff" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="AvgScore" fill="#3ecf8e" radius={[4, 4, 0, 0]} name="Avg Score %" />
             </BarChart>
           </ResponsiveContainer>
         </div>

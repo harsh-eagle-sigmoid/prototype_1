@@ -29,3 +29,5 @@ export const fetchErrorsByCategory = (category) => api.get(`${BASE}/errors/${cat
 export const sendQuery = (query, agentType) => api.post(`${BASE}/query`, { query, agent_type: agentType }).then(r => r.data);
 export const fetchUserInfo = () => api.get(`${BASE}/auth/me`).then(r => r.data);
 export const fetchHistory = (limit = 50) => api.get(`${BASE}/history`, { params: { limit } }).then(r => r.data);
+export const fetchAlerts = () => api.get(`${BASE}/alerts`).then(r => r.data);
+export const executeSql = (sql, agentType) => api.post(`${BASE}/debug/execute`, { sql, agent_type: agentType }).then(r => r.data);
